@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Star Catcher — Satu Prompt, Satu Game</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; background: #191419; overflow: hidden; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    color: #fff; display: flex; flex-direction: column; align-items: center;
+  }
+  #wrap { position: relative; width: min(100vw, 56.25vh); height: 100dvh; }
+  canvas { display: block; width: 100%; height: 100%; touch-action: none; cursor: pointer; }
+  .bar {
+    position: absolute; left: 0; right: 0; bottom: 0; padding: 10px 14px 14px;
+    display: flex; gap: 10px; justify-content: center; pointer-events: none;
+  }
+  .bar button {
+    pointer-events: auto; border: 0; border-radius: 999px; padding: 12px 22px;
+    font-size: 16px; font-weight: 700; cursor: pointer;
+    background: #e91e8c; color: #fff; box-shadow: 0 4px 18px rgba(233,30,140,.45);
+  }
+  .bar button.ghost { background: rgba(255,255,255,.14); color: #fff; box-shadow: none; }
+  #hint {
+    position: absolute; left: 0; right: 0; top: 8px; text-align: center;
+    font-size: 13px; color: rgba(255,255,255,.75); pointer-events: none;
+    text-shadow: 0 1px 4px #000;
+  }
+  #credit {
+    position: absolute; left: 0; right: 0; bottom: 64px; text-align: center;
+    font-size: 11px; color: rgba(255,255,255,.5); pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="720" height="1280"></canvas>
+  <div id="hint">Geser / sentuh / tombol &larr; &rarr; untuk menggerakkan keranjang</div>
+  <div class="bar">
+    <button id="btnStart">▶ Mulai</button>
+    <button id="btnPause" class="ghost" hidden>⏸ Jeda</button>
+  </div>
+  <div id="credit">Dibuat dari satu prompt oleh AI agent Hark &middot; untuk make.fun</div>
+</div>
+<script>
+"use strict";
+/* Star Catcher — game browser kecil yang dibuat dari SATU prompt:
+   "Buatkan game browser kecil: tangkap bintang jatuh. 60 detik, makin cepat makin seru."
+   Satu file, tanpa install, tanpa library. Main di HP maupun PC. */
+const cv = document.getElementById("game");
+const ctx = cv.getContext("2d");
+const W = 720, H = 1280;
+
+const STATE = { MENU: 0, PLAY: 1, PAUSE: 2, OVER: 3 };
+let state = STATE.MENU;
+let score = 0, combo = 0, bestCombo = 0, lives = 3, timeLeft = 60;
+let stars = [], parts = [], spawnT = 0, elapsed = 0, raf = 0, lastTs = 0;
+let best = 0;
+try { best = +localStorage.getItem("star-catcher-best") || 0; } catch (e) { best = 0; }
+
+const basket = { x: W / 2, y: H - 130, w: 170, h: 46, tx: W / 2 };
+let audio = null;
+function beep(freq, dur) {
+  try {
+    audio = audio || new (window.AudioContext || window.webkitAudioContext)();
+    const o = audio.createOscillator(), g = audio.createGain();
+    o.type = "sine"; o.frequency.value = freq;
+    g.gain.setValueAtTime(0.08, audio.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, audio.currentTime + dur);
+    o.connect(g); g.connect(audio.destination);
+    o.start(); o.stop(audio.currentTime + dur);
+  } catch (e) { /* suara opsional */ }
+}
+
+function rand(a, b) { return a + Math.random() * (b - a); }
+function spawnStar() {
+  const bomb = Math.random() < 0.16;
+  stars.push({
+    x: rand(50, W - 50), y: -30, r: bomb ? 26 : rand(20, 30),
+    vy: rand(260, 380) + Math.min(240, elapsed * 4),
+    vx: rand(-40, 40), rot: rand(0, 6.28), vr: rand(-2, 2),
+    bomb: bomb, hue: bomb ? 4 : 45
+  });
+}
+function burst(x, y, color, n) {
+  for (let i = 0; i < n; i++) {
+    parts.push({ x: x, y: y, vx: rand(-260, 260), vy: rand(-320, 60),
+                 life: rand(0.3, 0.7), max: 0.7, color: color, r: rand(3, 7) });
+  }
+}
+function starPath(r) {
+  ctx.beginPath();
+  for (let i = 0; i < 10; i++) {
+    const ang = -Math.PI / 2 + i * Math.PI / 5;
+    const rr = i % 2 === 0 ? r : r * 0.45;
+    const px = Math.cos(ang) * rr, py = Math.sin(ang) * rr;
+    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+}
+
+function update(dt) {
+  elapsed += dt;
+  timeLeft = Math.max(0, 60 - elapsed);
+  basket.x += (basket.tx - basket.x) * Math.min(1, dt * 14);
+  spawnT -= dt * 1000;
+  const interval = Math.max(340, 720 - elapsed * 8);
+  if (spawnT <= 0) { spawnStar(); spawnT = interval; }
+  for (let i = stars.length - 1; i >= 0; i--) {
+    const s = stars[i];
+    s.y += s.vy * dt; s.x += s.vx * dt; s.rot += s.vr * dt;
+    if (s.x < 30 || s.x > W - 30) s.vx *= -1;
+    const caught = s.y + s.r >= basket.y - 6 && s.y - s.r <= basket.y + basket.h
+      && Math.abs(s.x - basket.x) < basket.w / 2 + s.r * 0.5;
+    if (caught) {
+      if (s.bomb) {
+        lives--; combo = 0;
+        burst(s.x, s.y, "#ff3b30", 22); beep(140, 0.25);
+        if (navigator.vibrate) navigator.vibrate(120);
+      } else {
+        combo++; bestCombo = Math.max(bestCombo, combo);
+        const pts = 10 + Math.min(40, (combo - 1) * 5);
+        score += pts;
+        burst(s.x, s.y, "#ffd60a", 16); beep(520 + Math.min(400, combo * 30), 0.12);
+      }
+      stars.splice(i, 1); continue;
+    }
+    if (s.y - s.r > H) { if (!s.bomb) combo = 0; stars.splice(i, 1); }
+  }
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i];
+    p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 500 * dt; p.life -= dt;
+    if (p.life <= 0) parts.splice(i, 1);
+  }
+  if (lives <= 0 || timeLeft <= 0) endGame();
+}
+
+function drawSky() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#120e2a"); g.addColorStop(0.55, "#2b1055"); g.addColorStop(1, "#191419");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = "rgba(255,255,255,.8)";
+  for (let i = 0; i < 60; i++) {
+    const sx = (i * 137) % W, sy = (i * 211) % (H - 200);
+    const tw = 0.4 + 0.6 * Math.abs(Math.sin(elapsed * 2 + i));
+    ctx.globalAlpha = tw * 0.8;
+    ctx.fillRect(sx, sy, 3, 3);
+  }
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = "#ffd60a";
+  ctx.beginPath(); ctx.arc(600, 130, 46, 0, 6.29); ctx.fill();
+  ctx.fillStyle = "#120e2a";
+  ctx.beginPath(); ctx.arc(578, 112, 40, 0, 6.29); ctx.fill();
+}
+
+function drawBasket() {
+  ctx.save(); ctx.translate(basket.x, basket.y);
+  ctx.fillStyle = "#e91e8c";
+  ctx.beginPath();
+  ctx.moveTo(-basket.w / 2, 0); ctx.lineTo(basket.w / 2, 0);
+  ctx.lineTo(basket.w / 2 - 18, basket.h); ctx.lineTo(-basket.w / 2 + 18, basket.h);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = "#ff5db1"; ctx.fillRect(-basket.w / 2, -8, basket.w, 12);
+  ctx.strokeStyle = "rgba(255,255,255,.35)"; ctx.lineWidth = 3;
+  for (let i = -1; i <= 1; i++) {
+    ctx.beginPath(); ctx.moveTo(i * 40, 6); ctx.lineTo(i * 40 + 8, basket.h - 4); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function draw() {
+  drawSky();
+  for (const s of stars) {
+    ctx.save(); ctx.translate(s.x, s.y); ctx.rotate(s.rot);
+    if (s.bomb) {
+      ctx.fillStyle = "#ff3b30"; ctx.beginPath(); ctx.arc(0, 0, s.r, 0, 6.29); ctx.fill();
+      ctx.fillStyle = "#fff"; ctx.font = "bold 30px system-ui";
+      ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.fillText("!", 0, 2);
+      ctx.strokeStyle = "#ff3b30"; ctx.lineWidth = 4;
+      for (let k = 0; k < 8; k++) {
+        const a = k * Math.PI / 4;
+        ctx.beginPath(); ctx.moveTo(Math.cos(a) * s.r, Math.sin(a) * s.r);
+        ctx.lineTo(Math.cos(a) * (s.r + 10), Math.sin(a) * (s.r + 10)); ctx.stroke();
+      }
+    } else {
+      ctx.fillStyle = "#ffd60a"; starPath(s.r); ctx.fill();
+      ctx.fillStyle = "#fff3b0"; starPath(s.r * 0.55); ctx.fill();
+    }
+    ctx.restore();
+  }
+  for (const p of parts) {
+    ctx.globalAlpha = Math.max(0, p.life / p.max);
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 6.29); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  drawBasket();
+  ctx.textBaseline = "top";
+  ctx.fillStyle = "#fff"; ctx.font = "bold 44px system-ui"; ctx.textAlign = "left";
+  ctx.fillText("SKOR " + score, 28, 26);
+  ctx.textAlign = "right";
+  ctx.fillText("0:" + String(Math.ceil(timeLeft)).padStart(2, "0"), W - 28, 26);
+  ctx.font = "bold 30px system-ui";
+  ctx.fillText("♥".repeat(Math.max(0, lives)) + "♡".repeat(Math.max(0, 3 - lives)), W - 28, 84);
+  if (combo >= 3) {
+    ctx.textAlign = "center"; ctx.fillStyle = "#ffd60a";
+    ctx.font = "bold 52px system-ui";
+    ctx.fillText("COMBO x" + combo + "!", W / 2, 150);
+  }
+  if (state === STATE.MENU) {
+    ctx.fillStyle = "rgba(10,6,18,.72)"; ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = "center"; ctx.fillStyle = "#ffd60a";
+    ctx.font = "bold 96px system-ui";
+    ctx.fillText("★ STAR", W / 2, 380);
+    ctx.fillStyle = "#fff"; ctx.fillText("CATCHER", W / 2, 490);
+    ctx.fillStyle = "#ff5db1"; ctx.font = "bold 40px system-ui";
+    ctx.fillText("Satu prompt. Satu game.", W / 2, 600);
+    ctx.fillStyle = "#fff"; ctx.font = "28px system-ui";
+    ctx.fillText("Tangkap bintang jatuh, hindari bom.", W / 2, 680);
+    ctx.fillText("60 detik. Makin cepat, makin seru.", W / 2, 724);
+    ctx.fillStyle = "rgba(255,255,255,.75)"; ctx.font = "26px system-ui";
+    ctx.fillText("Skor terbaik: " + best, W / 2, 800);
+  }
+  if (state === STATE.OVER) {
+    ctx.fillStyle = "rgba(10,6,18,.78)"; ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = "center"; ctx.fillStyle = "#ffd60a";
+    ctx.font = "bold 84px system-ui";
+    ctx.fillText("WAKTU HABIS!", W / 2, 420);
+    ctx.fillStyle = "#fff"; ctx.font = "bold 64px system-ui";
+    ctx.fillText("Skor: " + score, W / 2, 540);
+    ctx.font = "36px system-ui";
+    ctx.fillText("Kombo terbaik: x" + bestCombo, W / 2, 640);
+    ctx.fillText("Skor terbaik: " + best, W / 2, 694);
+    ctx.fillStyle = "#ff5db1"; ctx.font = "bold 34px system-ui";
+    ctx.fillText("Tekan MULAI untuk main lagi", W / 2, 790);
+  }
+  if (state === STATE.PAUSE) {
+    ctx.fillStyle = "rgba(10,6,18,.6)"; ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = "center"; ctx.fillStyle = "#fff";
+    ctx.font = "bold 72px system-ui"; ctx.fillText("JEDA", W / 2, 560);
+  }
+}
+
+function loop(ts) {
+  raf = requestAnimationFrame(loop);
+  const dt = Math.min(0.05, (ts - lastTs) / 1000 || 0.016);
+  lastTs = ts;
+  if (state === STATE.PLAY) update(dt);
+  draw();
+}
+
+function startGame() {
+  score = 0; combo = 0; bestCombo = 0; lives = 3; elapsed = 0; timeLeft = 60;
+  stars = []; parts = []; spawnT = 0;
+  state = STATE.PLAY;
+  document.getElementById("btnStart").hidden = true;
+  document.getElementById("btnPause").hidden = false;
+  beep(660, 0.1);
+}
+function endGame() {
+  state = STATE.OVER;
+  if (score > best) {
+    best = score;
+    try { localStorage.setItem("star-catcher-best", String(best)); } catch (e) {}
+  }
+  document.getElementById("btnStart").hidden = false;
+  document.getElementById("btnStart").textContent = "↻ Main Lagi";
+  document.getElementById("btnPause").hidden = true;
+  beep(220, 0.3);
+}
+function togglePause() {
+  if (state === STATE.PLAY) { state = STATE.PAUSE; document.getElementById("btnPause").textContent = "▶ Lanjut"; }
+  else if (state === STATE.PAUSE) { state = STATE.PLAY; document.getElementById("btnPause").textContent = "⏸ Jeda"; }
+}
+
+function pointerX(e) {
+  const r = cv.getBoundingClientRect();
+  const cx = (e.touches ? e.touches[0].clientX : e.clientX) - r.left;
+  return cx / r.width * W;
+}
+cv.addEventListener("pointermove", function (e) { basket.tx = pointerX(e); });
+cv.addEventListener("pointerdown", function (e) {
+  basket.tx = pointerX(e);
+  if (state === STATE.MENU || state === STATE.OVER) startGame();
+});
+window.addEventListener("keydown", function (e) {
+  if (e.key === "ArrowLeft" || e.key === "a" || e.key === "A") basket.tx = Math.max(90, basket.tx - 60);
+  if (e.key === "ArrowRight" || e.key === "d" || e.key === "D") basket.tx = Math.min(W - 90, basket.tx + 60);
+  if (e.key === " " || e.key === "Enter") {
+    if (state === STATE.MENU || state === STATE.OVER) startGame();
+    else togglePause();
+  }
+  if (e.key === "p" || e.key === "P") togglePause();
+});
+document.getElementById("btnStart").addEventListener("click", startGame);
+document.getElementById("btnPause").addEventListener("click", togglePause);
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
